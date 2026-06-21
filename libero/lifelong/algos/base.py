@@ -6,6 +6,7 @@ import robomimic.utils.tensor_utils as TensorUtils
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import wandb
 from torch.utils.data import DataLoader, RandomSampler
 
 from libero.lifelong.metric import *
@@ -117,6 +118,8 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
                 self.policy.parameters(), self.cfg.train.grad_clip
             )
         self.optimizer.step()
+        if hasattr(self.policy, "update_ema"):
+            self.policy.update_ema()
         return loss.item()
 
     def eval_observe(self, data):
@@ -142,7 +145,7 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
             batch_size=self.cfg.train.batch_size,
             num_workers=self.cfg.train.num_workers,
             sampler=RandomSampler(dataset),
-            persistent_workers=True,
+            persistent_workers=self.cfg.train.num_workers > 0,
         )
 
         prev_success_rate = -1.0
@@ -154,6 +157,15 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
         idx_at_best_succ = 0
         successes = []
         losses = []
+        early_stop_cfg = self.cfg.train.get("early_stop", {})
+        early_stop_enabled = early_stop_cfg.get("enabled", False)
+        early_stop_metric = early_stop_cfg.get("metric", "success")
+        early_stop_patience = early_stop_cfg.get("patience", 3)
+        early_stop_min_delta = early_stop_cfg.get("min_delta", 0.0)
+        early_stop_min_epoch = early_stop_cfg.get("min_epoch", 0)
+        early_stop_best = None
+        early_stop_bad_checks = 0
+        stop_training = False
 
         task = benchmark.get_task(task_id)
         task_emb = benchmark.get_task_emb(task_id)
@@ -181,8 +193,19 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
             print(
                 f"[info] Epoch: {epoch:3d} | train loss: {training_loss:5.2f} | time: {(t1-t0)/60:4.2f}"
             )
+            if self.cfg.use_wandb:
+                wandb.log(
+                    {
+                        "train/loss": training_loss,
+                        "train/epoch_time_min": (t1 - t0) / 60,
+                        "task_id": task_id,
+                        "epoch": epoch,
+                    },
+                    step=epoch,
+                )
 
-            if epoch % self.cfg.eval.eval_every == 0:  # evaluate BC loss
+            if self.cfg.eval.eval and epoch % self.cfg.eval.eval_every == 0:
+                # evaluate rollout success when requested
                 # every eval_every epoch, we evaluate the agent on the current task,
                 # then we pick the best performant agent on the current task as
                 # if it stops learning after that specific epoch. So the stopping
@@ -224,9 +247,62 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
                     + f"| succ. AoC {tmp_successes.sum()/cumulated_counter:4.2f} | time: {(t1-t0)/60:4.2f}",
                     flush=True,
                 )
+                if self.cfg.use_wandb:
+                    wandb.log(
+                        {
+                            "eval/success": success_rate,
+                            "eval/success_ci": ci,
+                            "eval/best_success": prev_success_rate,
+                            "eval/success_aoc": tmp_successes.sum()
+                            / cumulated_counter,
+                            "eval/rollout_time_min": (t1 - t0) / 60,
+                            "task_id": task_id,
+                            "epoch": epoch,
+                        },
+                        step=epoch,
+                    )
+
+                if early_stop_enabled and epoch >= early_stop_min_epoch:
+                    if early_stop_metric == "success":
+                        metric_value = success_rate
+                        improved = early_stop_best is None or (
+                            metric_value > early_stop_best + early_stop_min_delta
+                        )
+                    elif early_stop_metric == "loss":
+                        metric_value = training_loss
+                        improved = early_stop_best is None or (
+                            metric_value < early_stop_best - early_stop_min_delta
+                        )
+                    else:
+                        raise ValueError(
+                            "train.early_stop.metric must be 'success' or 'loss', "
+                            f"got {early_stop_metric!r}"
+                        )
+                    if improved:
+                        early_stop_best = metric_value
+                        early_stop_bad_checks = 0
+                    else:
+                        early_stop_bad_checks += 1
+                    if early_stop_bad_checks >= early_stop_patience:
+                        print(
+                            f"[info] early stopping at epoch {epoch}: "
+                            + f"{early_stop_metric} has not improved for "
+                            + f"{early_stop_bad_checks} eval checks",
+                            flush=True,
+                        )
+                        stop_training = True
 
             if self.scheduler is not None and epoch > 0:
                 self.scheduler.step()
+
+            if stop_training:
+                break
+
+        if not self.cfg.eval.eval:
+            torch_save_model(self.policy, model_checkpoint_name, cfg=self.cfg)
+            losses.append(training_loss)
+            successes.append(0.0)
+            cumulated_counter = 1.0
 
         # load the best performance agent on the current task
         self.policy.load_state_dict(torch_load_model(model_checkpoint_name)[0])

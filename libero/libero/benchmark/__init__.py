@@ -185,6 +185,19 @@ class LIBERO_OBJECT(Benchmark):
 
 
 @register_benchmark
+class LIBERO_ALPHABET_SOUP(Benchmark):
+    def __init__(self, task_order_index=0):
+        super().__init__(task_order_index=task_order_index)
+        self.name = "libero_alphabet_soup"
+        self.tasks = [
+            task_maps["libero_object"][
+                "pick_up_the_alphabet_soup_and_place_it_in_the_basket"
+            ]
+        ]
+        self.n_tasks = len(self.tasks)
+
+
+@register_benchmark
 class LIBERO_GOAL(Benchmark):
     def __init__(self, task_order_index=0):
         super().__init__(task_order_index=task_order_index)

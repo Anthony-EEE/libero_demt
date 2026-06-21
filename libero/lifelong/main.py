@@ -132,7 +132,7 @@ def main(hydra_cfg):
     cfg.shape_meta = shape_meta
 
     if cfg.use_wandb:
-        wandb.init(project="libero", config=cfg)
+        wandb.init(project=cfg.wandb_project, config=cfg)
         wandb.run.name = cfg.experiment_name
 
     result_summary = {

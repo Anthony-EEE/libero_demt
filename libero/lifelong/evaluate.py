@@ -51,6 +51,7 @@ benchmark_map = {
     "libero_10": "LIBERO_10",
     "libero_spatial": "LIBERO_SPATIAL",
     "libero_object": "LIBERO_OBJECT",
+    "libero_alphabet_soup": "LIBERO_ALPHABET_SOUP",
     "libero_goal": "LIBERO_GOAL",
 }
 
@@ -66,6 +67,7 @@ policy_map = {
     "bc_rnn_policy": "BCRNNPolicy",
     "bc_transformer_policy": "BCTransformerPolicy",
     "bc_vilt_policy": "BCViLTPolicy",
+    "diffusion_policy": "DiffusionPolicy",
 }
 
 
@@ -77,7 +79,13 @@ def parse_args():
         "--benchmark",
         type=str,
         required=True,
-        choices=["libero_10", "libero_spatial", "libero_object", "libero_goal"],
+        choices=[
+            "libero_10",
+            "libero_spatial",
+            "libero_object",
+            "libero_alphabet_soup",
+            "libero_goal",
+        ],
     )
     parser.add_argument("--task_id", type=int, required=True)
     # method detail
@@ -91,12 +99,22 @@ def parse_args():
         "--policy",
         type=str,
         required=True,
-        choices=["bc_rnn_policy", "bc_transformer_policy", "bc_vilt_policy"],
+        choices=[
+            "bc_rnn_policy",
+            "bc_transformer_policy",
+            "bc_vilt_policy",
+            "diffusion_policy",
+        ],
     )
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--ep", type=int)
     parser.add_argument("--load_task", type=int)
     parser.add_argument("--device_id", type=int)
+    parser.add_argument("--folder", type=str, default=None)
+    parser.add_argument("--n-eval", type=int, default=None)
+    parser.add_argument("--num-procs", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--run-id", type=int, default=None)
     parser.add_argument("--save-videos", action="store_true")
     # parser.add_argument('--save_dir',  type=str, required=True)
     args = parser.parse_args()
@@ -108,9 +126,10 @@ def parse_args():
             range(0, 50, 5)
         ), "[error] ep should be in [0, 5, ..., 50]"
     else:
+        max_load_task = 1 if args.benchmark == "libero_alphabet_soup" else 10
         assert args.load_task in list(
-            range(10)
-        ), "[error] load_task should be in [0, ..., 9]"
+            range(max_load_task)
+        ), f"[error] load_task should be in [0, ..., {max_load_task - 1}]"
     return args
 
 
@@ -126,16 +145,17 @@ def main():
     )
 
     # find the checkpoint
-    experiment_id = 0
-    for path in Path(experiment_dir).glob("run_*"):
-        if not path.is_dir():
-            continue
-        try:
-            folder_id = int(str(path).split("run_")[-1])
-            if folder_id > experiment_id:
-                experiment_id = folder_id
-        except BaseException:
-            pass
+    experiment_id = args.run_id or 0
+    if experiment_id == 0:
+        for path in Path(experiment_dir).glob("run_*"):
+            if not path.is_dir():
+                continue
+            try:
+                folder_id = int(str(path).split("run_")[-1])
+                if folder_id > experiment_id:
+                    experiment_id = folder_id
+            except BaseException:
+                pass
     if experiment_id == 0:
         print(f"[error] cannot find the checkpoint under {experiment_dir}")
         sys.exit(0)
@@ -156,12 +176,35 @@ def main():
         print(f"[error] cannot find the checkpoint at {str(model_path)}")
         sys.exit(0)
 
-    cfg.folder = get_libero_path("datasets")
+    cfg.folder = args.folder or getattr(cfg, "folder", None) or get_libero_path("datasets")
     cfg.bddl_folder = get_libero_path("bddl_files")
     cfg.init_states_folder = get_libero_path("init_states")
 
     cfg.device = args.device_id
-    algo = safe_device(eval(algo_map[args.algo])(10, cfg), cfg.device)
+    if args.n_eval is not None:
+        cfg.eval.n_eval = args.n_eval
+    if args.num_procs is not None:
+        cfg.eval.num_procs = args.num_procs
+    if args.max_steps is not None:
+        cfg.eval.max_steps = args.max_steps
+
+    if not hasattr(cfg.data, "task_order_index"):
+        cfg.data.task_order_index = 0
+
+    # get the benchmark the task belongs to
+    benchmark = get_benchmark(cfg.benchmark_name)(cfg.data.task_order_index)
+    if not (0 <= args.task_id < benchmark.n_tasks):
+        print(
+            f"[error] task_id {args.task_id} is out of range for "
+            + f"{cfg.benchmark_name}; expected [0, {benchmark.n_tasks - 1}]"
+        )
+        sys.exit(0)
+
+    descriptions = [benchmark.get_task(i).language for i in range(benchmark.n_tasks)]
+    task_embs = get_task_embs(cfg, descriptions)
+    benchmark.set_task_embs(task_embs)
+
+    algo = safe_device(eval(algo_map[args.algo])(benchmark.n_tasks, cfg), cfg.device)
     algo.policy.previous_mask = previous_mask
 
     if cfg.lifelong.algo == "PackNet":
@@ -177,15 +220,6 @@ def main():
                 module.eval()
 
     algo.policy.load_state_dict(sd)
-
-    if not hasattr(cfg.data, "task_order_index"):
-        cfg.data.task_order_index = 0
-
-    # get the benchmark the task belongs to
-    benchmark = get_benchmark(cfg.benchmark_name)(cfg.data.task_order_index)
-    descriptions = [benchmark.get_task(i).language for i in range(10)]
-    task_embs = get_task_embs(cfg, descriptions)
-    benchmark.set_task_embs(task_embs)
 
     task = benchmark.get_task(args.task_id)
 
@@ -240,51 +274,58 @@ def main():
             "camera_widths": cfg.data.img_w,
         }
 
-        env_num = 20
+        env_num = min(cfg.eval.num_procs, cfg.eval.n_eval)
+        eval_loop_num = (cfg.eval.n_eval + env_num - 1) // env_num
         env = SubprocVectorEnv(
             [lambda: OffScreenRenderEnv(**env_args) for _ in range(env_num)]
         )
-        env.reset()
         env.seed(cfg.seed)
-        algo.reset()
 
         init_states_path = os.path.join(
             cfg.init_states_folder, task.problem_folder, task.init_states_file
         )
         init_states = torch.load(init_states_path)
-        indices = np.arange(env_num) % init_states.shape[0]
-        init_states_ = init_states[indices]
-
-        dones = [False] * env_num
-        steps = 0
-        obs = env.set_init_state(init_states_)
         task_emb = benchmark.get_task_emb(args.task_id)
 
         num_success = 0
-        for _ in range(5):  # simulate the physics without any actions
-            env.step(np.zeros((env_num, 7)))
-
         with torch.no_grad():
-            while steps < cfg.eval.max_steps:
-                steps += 1
+            for i in range(eval_loop_num):
+                env.reset()
+                algo.reset()
+                video_writer.reset()
 
-                data = raw_obs_to_tensor_obs(obs, task_emb, cfg)
-                actions = algo.policy.get_action(data)
-                obs, reward, done, info = env.step(actions)
-                video_writer.append_vector_obs(
-                    obs, dones, camera_name="agentview_image"
-                )
+                start = i * env_num
+                indices = np.arange(start, start + env_num) % init_states.shape[0]
+                init_states_ = init_states[indices]
 
-                # check whether succeed
+                dones = [False] * env_num
+                steps = 0
+                obs = env.set_init_state(init_states_)
+
+                for _ in range(5):  # simulate the physics without any actions
+                    obs, _, _, _ = env.step(np.zeros((env_num, 7)))
+
+                while steps < cfg.eval.max_steps:
+                    steps += 1
+
+                    data = raw_obs_to_tensor_obs(obs, task_emb, cfg)
+                    actions = algo.policy.get_action(data)
+                    obs, reward, done, info = env.step(actions)
+                    video_writer.append_vector_obs(
+                        obs, dones, camera_name="agentview_image"
+                    )
+
+                    # check whether succeed
+                    for k in range(env_num):
+                        dones[k] = dones[k] or done[k]
+                    if all(dones):
+                        break
+
                 for k in range(env_num):
-                    dones[k] = dones[k] or done[k]
-                if all(dones):
-                    break
+                    if start + k < cfg.eval.n_eval:
+                        num_success += int(dones[k])
 
-            for k in range(env_num):
-                num_success += int(dones[k])
-
-        success_rate = num_success / env_num
+        success_rate = num_success / cfg.eval.n_eval
         env.close()
 
         eval_stats = {

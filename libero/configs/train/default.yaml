@@ -12,6 +12,16 @@ debug: false
 
 use_augmentation: true
 
+# Optional early stopping. Disabled by default.
+# metric: "success" checks rollout success at eval checkpoints; higher is better.
+# metric: "loss" checks training loss at eval checkpoints; lower is better.
+early_stop:
+    enabled: false
+    metric: success
+    patience: 3
+    min_delta: 0.0
+    min_epoch: 0
+
 defaults:
     - optimizer@optimizer: adam_w.yaml
     - scheduler@scheduler: cosine_annealing.yaml

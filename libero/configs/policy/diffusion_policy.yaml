@@ -1,0 +1,29 @@
+policy_type: DiffusionPolicy
+
+obs_horizon: 2
+pred_horizon: 16
+action_horizon: 8
+num_diffusion_iters: 100
+num_train_timesteps: 100
+inference_scheduler: ddim
+num_inference_iters: 10
+beta_schedule: squaredcos_cap_v2
+prediction_type: epsilon
+ddim_set_alpha_to_one: true
+ddim_steps_offset: 0
+enforce_action_bounds: true
+vision_feature_dim: 512
+diffusion_step_embed_dim: 256
+down_dims: [256, 512, 1024]
+kernel_size: 5
+n_groups: 8
+clip_sample: true
+
+pretrained_resnet: false
+use_ema: true
+ema_power: 0.75
+
+defaults:
+    - data_augmentation@color_aug: batch_wise_img_color_jitter_group_aug.yaml
+    - data_augmentation@translation_aug: translation_aug.yaml
+    - language_encoder: identity_encoder.yaml
